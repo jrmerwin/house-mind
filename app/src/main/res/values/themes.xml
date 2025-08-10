@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- App theme for Views (no Compose) -->
+    <style name="Theme.LD1" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Customize if you like -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+    </style>
+</resources>
