@@ -5,6 +5,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
+    <!-- Top bar -->
     <com.google.android.material.appbar.MaterialToolbar
         android:id="@+id/topAppBar"
         android:layout_width="0dp"
@@ -14,8 +15,9 @@
         app:menu="@menu/top_app_bar_menu"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"/>
+        app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Chat list -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/chatRecycler"
         android:layout_width="0dp"
@@ -25,8 +27,21 @@
         app:layout_constraintTop_toBottomOf="@id/topAppBar"
         app:layout_constraintBottom_toTopOf="@id/composerCard"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"/>
+        app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Centered circular mic button (FAB) above composer -->
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/micBtn"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:contentDescription="@string/app_name"
+        app:srcCompat="@android:drawable/ic_btn_speak_now"
+        app:layout_constraintBottom_toTopOf="@id/composerCard"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_marginBottom="8dp" />
+
+    <!-- Composer -->
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/composerCard"
         android:layout_width="0dp"
@@ -51,7 +66,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:hint="Message LD‑1…"
+                android:hint="Message LD-1…"
                 app:boxBackgroundMode="none">
 
                 <com.google.android.material.textfield.TextInputEditText
@@ -63,14 +78,7 @@
                     android:maxLines="4"/>
             </com.google.android.material.textfield.TextInputLayout>
 
-            <ImageButton
-                android:id="@+id/micBtn"
-                android:layout_width="48dp"
-                android:layout_height="48dp"
-                android:contentDescription="Speak"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:src="@android:drawable/ic_btn_speak_now" />
-
+            <!-- Send button stays on the right -->
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/sendBtn"
                 android:layout_width="wrap_content"

@@ -1,8 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<menu xmlns:android="http://schemas.android.com/apk/res/android">
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
     <item
         android:id="@+id/action_status"
-        android:title="LD‑1: online"
-        android:showAsAction="always" />
+        android:title=""
+    android:icon="@drawable/status_dot_offline"
+    app:showAsAction="always"
+    app:iconTint="@null" />
 </menu>
+
+
 

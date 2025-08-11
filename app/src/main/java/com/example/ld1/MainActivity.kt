@@ -8,8 +8,11 @@ import android.os.Build
 import android.os.Bundle
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.speech.RecognitionListener
 import android.util.Base64
 import android.util.Log
+import android.view.MotionEvent
+import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -33,15 +36,36 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 
+import android.os.Handler
+import android.os.Looper
+import java.io.IOException
+
+import androidx.appcompat.content.res.AppCompatResources
+import androidx.core.graphics.drawable.DrawableCompat
+
+
+
 class MainActivity : AppCompatActivity() {
+
+    // ONE endpoint only:
+    private val LD1_ENDPOINT = "http://192.168.1.39:8080/respond"
+
+    // Derive /health from /respond (lazy avoids init order issues)
+    private val HEALTH_URL by lazy { LD1_ENDPOINT.replace(Regex("/respond$"), "/health") }
+
+    private val healthHandler = Handler(Looper.getMainLooper())
+    private val healthTicker = object : Runnable {
+        override fun run() {
+            pingServer()
+            healthHandler.postDelayed(this, 15_000L) // every 15s
+        }
+    }
 
     private lateinit var binding: ActivityMainBinding
     private val adapter = ChatAdapter()
     private val messages = mutableListOf<ChatMessage>()
-    private var isConnectedToLD1 = true
+    private var isConnectedToLD1 = false
 
-    // ---- Endpoint (keep ONE; pointing to your Pi) ----
-    private val LD1_ENDPOINT = "http://192.168.1.39:8080/respond"
 
     // ---- Networking ----
     private val http = OkHttpClient()
@@ -54,21 +78,20 @@ class MainActivity : AppCompatActivity() {
     // ---- Audio player ----
     private var player: ExoPlayer? = null
 
-    // ---- STT permission + launcher ----
+    // ---- Push-to-talk STT ----
+    private var recognizer: SpeechRecognizer? = null
+    private var isListening = false
+    private var pendingAutoSendText: String? = null
+
+    // Permission launcher for mic
     private val requestAudioPerm = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> if (granted) startSpeechToText() else toast("Microphone permission denied") }
-
-    private val sttLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { res ->
-        if (res.resultCode == RESULT_OK) {
-            val results = res.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            val first = results?.firstOrNull()
-            if (!first.isNullOrBlank()) {
-                binding.input.setText(first)
-                binding.input.setSelection(first.length)
-            }
+    ) { granted ->
+        if (granted) {
+            createRecognizer()
+            toast("Mic ready — press & hold to talk")
+        } else {
+            toast("Microphone permission denied")
         }
     }
 
@@ -78,9 +101,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         setSupportActionBar(binding.topAppBar)
-        updateStatusText()
+        updateStatusUI()
 
-        binding.chatRecycler.layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
+        binding.chatRecycler.layoutManager = LinearLayoutManager(this)
         binding.chatRecycler.adapter = adapter
 
         player = ExoPlayer.Builder(this).build().apply {
@@ -102,13 +125,158 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        binding.micBtn.setOnClickListener { ensureAudioPermissionAndStart() }
+        // Push & hold mic: start on DOWN, stop on UP/CANCEL (auto-send on final result)
+        binding.micBtn.setOnTouchListener { _: View, ev: MotionEvent ->
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (ensureAudioPermission()) {
+                        startListening()
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (isListening) stopListening()
+                    true
+                }
+                else -> false
+            }
+        }
+
+        // Prepare recognizer if permission already granted
+        if (hasMicPermission()) createRecognizer()
+    }
+
+    // ---- STT helpers ----
+
+    private fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+
+    private fun ensureAudioPermission(): Boolean {
+        return if (hasMicPermission()) {
+            true
+        } else {
+            // User will need to press & hold again after granting
+            requestAudioPerm.launch(Manifest.permission.RECORD_AUDIO)
+            false
+        }
+    }
+
+    private fun createRecognizer() {
+        recognizer?.destroy()
+        recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+            setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    isListening = true
+                    binding.micBtn.isActivated = true
+                }
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {
+                    binding.micBtn.isActivated = false
+                }
+                override fun onError(error: Int) {
+                    isListening = false
+                    binding.micBtn.isActivated = false
+                    Log.w("LD1Chat", "STT error: $error")
+                    // No auto-send on error
+                }
+                override fun onResults(results: Bundle) {
+                    isListening = false
+                    binding.micBtn.isActivated = false
+                    val texts = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val finalText = texts?.firstOrNull()?.trim().orEmpty()
+                    if (finalText.isNotEmpty()) {
+                        pendingAutoSendText = finalText
+                        // auto-fill and auto-send
+                        binding.input.setText(finalText)
+                        binding.input.setSelection(finalText.length)
+                        addMessage(finalText, fromUser = true)
+                        binding.input.setText("")
+                        sendToLd1(finalText)
+                    }
+                }
+                override fun onPartialResults(partialResults: Bundle) {
+                    val partial = partialResults
+                        .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                    if (!partial.isNullOrBlank()) {
+                        binding.input.setText(partial)
+                        binding.input.setSelection(partial.length)
+                    }
+                }
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+        }
+    }
+
+    private fun startListening() {
+        if (recognizer == null) createRecognizer()
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        try {
+            recognizer?.startListening(intent)
+        } catch (e: Exception) {
+            Log.e("LD1Chat", "startListening failed", e)
+            toast("Couldn’t start mic")
+        }
+    }
+
+    private fun stopListening() {
+        try {
+            recognizer?.stopListening()
+        } catch (_: Exception) {
+        }
     }
 
     // ---- Chat flow ----
 
+    override fun onStart() {
+        super.onStart()
+        updateStatusUI()                 // show initial state
+        pingServer()                     // immediate
+        healthHandler.post(healthTicker) // then every 15s
+    }
+
+    override fun onStop() {
+        super.onStop()
+        player?.pause()
+        healthHandler.removeCallbacks(healthTicker)
+    }
+
+    private fun pingServer() {
+        Log.d("LD1Chat", "PING $HEALTH_URL")
+        val req = Request.Builder().url(HEALTH_URL).get().build()
+        http.newCall(req).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: IOException) {
+                Log.d("LD1Chat", "PING fail: ${e.message}")
+                if (isConnectedToLD1) {
+                    isConnectedToLD1 = false
+                    runOnUiThread { updateStatusUI() }
+                }
+            }
+            override fun onResponse(call: okhttp3.Call, response: Response) {
+                val ok = response.isSuccessful
+                val body = response.body?.string().orEmpty()
+                Log.d("LD1Chat", "PING ${response.code}: $body")
+                response.close()
+                if (isConnectedToLD1 != ok) {
+                    isConnectedToLD1 = ok
+                    runOnUiThread { updateStatusUI() }
+                }
+            }
+        })
+    }
+
+
     private fun sendToLd1(userText: String) {
         val payload = """{"text": ${userText.toJsonString()}, "speak": true}"""
+        Log.d("LD1Chat", "POST $LD1_ENDPOINT payload=$payload")
         val req = Request.Builder()
             .url(LD1_ENDPOINT)
             .post(payload.toRequestBody(jsonMedia))
@@ -116,34 +284,29 @@ class MainActivity : AppCompatActivity() {
 
         http.newCall(req).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                runOnUiThread {
-                    toast("Network error: ${e.message}")
-                    showReplyAndMaybeSpeak("Echo from LD-1: $userText", null, null)
-                }
+                Log.e("LD1Chat", "HTTP fail: ${e.message}", e)
+                runOnUiThread { toast("Network error: ${e.message}") }
             }
             override fun onResponse(call: okhttp3.Call, response: Response) {
-                response.use {
-                    if (!it.isSuccessful) {
-                        runOnUiThread {
-                            toast("Server error: ${it.code}")
-                            showReplyAndMaybeSpeak("Echo from LD-1: $userText", null, null)
-                        }
-                        return
-                    }
-                    val body = it.body?.string().orEmpty()
-                    val parsed = runCatching { piRespondAdapter.fromJson(body) }.getOrNull()
-                    runOnUiThread {
-                        if (parsed == null) {
-                            toast("Bad response")
-                            showReplyAndMaybeSpeak("Echo from LD-1: $userText", null, null)
-                        } else {
-                            showReplyAndMaybeSpeak(
-                                parsed.text,
-                                null,
-                                parsed.audio_wav_b64 to "audio/wav"
-                            )
-                            parsed.warning?.let { w -> toast(w) }
-                        }
+                val code = response.code
+                val body = response.body?.string().orEmpty()
+                Log.d("LD1Chat", "HTTP $code body=$body")
+                response.close()
+                if (code !in 200..299) {
+                    runOnUiThread { toast("Server error: $code") }
+                    return
+                }
+                val parsed = runCatching { piRespondAdapter.fromJson(body) }.getOrNull()
+                runOnUiThread {
+                    if (parsed == null) {
+                        toast("Bad JSON from server")
+                    } else {
+                        showReplyAndMaybeSpeak(
+                            parsed.text,
+                            null,
+                            parsed.audio_wav_b64 to "audio/wav"
+                        )
+                        parsed.warning?.let { w -> toast(w) }
                     }
                 }
             }
@@ -156,11 +319,13 @@ class MainActivity : AppCompatActivity() {
         audioBytes: Pair<String?, String?>?
     ) {
         addMessage(text, fromUser = false)
+
+        val b64  = audioBytes?.first
+        val mime = audioBytes?.second
+
         when {
-            !audioUrl.isNullOrBlank() ->
-                playFromUrl(audioUrl)
-            !audioBytes?.first.isNullOrBlank() ->
-                playFromBase64(audioBytes!!.first!!, audioBytes.second)
+            !audioUrl.isNullOrBlank() -> playFromUrl(audioUrl)
+            !b64.isNullOrBlank()      -> playFromBase64(b64, mime)
             else -> { /* silent */ }
         }
     }
@@ -200,34 +365,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---- STT helpers ----
-
-    private fun ensureAudioPermissionAndStart() {
-        val needsRuntime =
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-                    (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                            != PackageManager.PERMISSION_GRANTED)
-
-        if (needsRuntime) {
-            requestAudioPerm.launch(Manifest.permission.RECORD_AUDIO)
-        } else {
-            startSpeechToText()
-        }
-    }
-
-    private fun startSpeechToText() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            toast("Speech recognition not available on this device")
-            return
-        }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to LD-1…")
-        }
-        sttLauncher.launch(intent)
-    }
-
     // ---- Recycler helpers ----
 
     private fun addMessage(text: String, fromUser: Boolean) {
@@ -236,21 +373,31 @@ class MainActivity : AppCompatActivity() {
         binding.chatRecycler.scrollToPosition(messages.lastIndex)
     }
 
-    private fun updateStatusText() {
-        val item = binding.topAppBar.menu?.findItem(R.id.action_status)
-        item?.title = if (isConnectedToLD1) "LD-1: online" else "LD-1: offline"
+    private fun updateStatusUI() {
+        // Text cue in the bar
+        binding.topAppBar.subtitle = if (isConnectedToLD1) "online" else "offline"
+
+        // Icon cue in the menu, without toolbar tint
+        val item = binding.topAppBar.menu?.findItem(R.id.action_status) ?: return
+        val iconRes = if (isConnectedToLD1) R.drawable.status_dot_online else R.drawable.status_dot_offline
+        AppCompatResources.getDrawable(this, iconRes)?.let { raw ->
+            val d = raw.mutate()
+            DrawableCompat.setTintList(d, null)   // kill automatic tinting
+            item.icon = d
+        }
+        item.title = if (isConnectedToLD1) "LD-1: online" else "LD-1: offline"
     }
+
+
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
-    override fun onStop() {
-        super.onStop()
-        player?.pause()
-    }
 
     override fun onDestroy() {
         player?.release()
         player = null
+        recognizer?.destroy()
+        recognizer = null
         super.onDestroy()
     }
 }
@@ -272,4 +419,3 @@ private fun String.toJsonString(): String =
         }
         append('"')
     }
-
